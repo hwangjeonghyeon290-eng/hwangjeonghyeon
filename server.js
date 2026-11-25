@@ -1,14 +1,18 @@
 const http = require("node:http");
 const fs = require("node:fs");
 const path = require("node:path");
+const { createHmac, randomUUID, timingSafeEqual } = require("node:crypto");
 
 const ROOT = __dirname;
 loadEnv(path.join(ROOT, ".env"));
 
 const PORT = Number(process.env.PORT || 8765);
+const IS_RAILWAY = Boolean(process.env.RAILWAY_ENVIRONMENT_ID);
+const HOST = IS_RAILWAY ? "0.0.0.0" : "127.0.0.1";
 const BASE_URL = (process.env.ANYTHINGLLM_URL || "").replace(/\/+$/, "");
 const API_KEY = process.env.ANYTHINGLLM_API_KEY || "";
 const WORKSPACE_SLUG = process.env.ANYTHINGLLM_WORKSPACE_SLUG || "";
+const SETTINGS_LOCATION = IS_RAILWAY ? "Railway Variables" : ".env";
 
 const MAX_JSON_BYTES = 32 * 1024 * 1024;
 const MAX_ATTACHMENTS = 10;
@@ -71,7 +75,7 @@ async function checkAnythingLlm(response) {
   if (missing.length) {
     return sendJson(response, 503, {
       connected: false,
-      error: `.env 설정이 필요합니다: ${missing.join(", ")}`,
+      error: `${SETTINGS_LOCATION} 설정이 필요합니다: ${missing.join(", ")}`,
     });
   }
 
@@ -100,7 +104,7 @@ async function chat(request, response) {
   const missing = missingSettings();
   if (missing.length) {
     return sendJson(response, 503, {
-      error: `.env 설정이 필요합니다: ${missing.join(", ")}`,
+      error: `${SETTINGS_LOCATION} 설정이 필요합니다: ${missing.join(", ")}`,
     });
   }
 
@@ -111,7 +115,7 @@ async function chat(request, response) {
     const sessionId =
       typeof body.sessionId === "string" && body.sessionId.trim()
         ? body.sessionId.trim().slice(0, 128)
-        : "plant-observation";
+        : randomUUID();
 
     if (!message && attachments.length) {
       message = defaultMessageFor(attachments);
@@ -290,7 +294,7 @@ function fileFromOutput(item) {
       kind,
       mime: mimeFromName(displayName || storageName),
       size: Number(payload.fileSize) || 0,
-      url: `/api/files/${encodeURIComponent(storageName)}?name=${encodeURIComponent(displayName)}`,
+      url: downloadUrl(storageName, displayName),
     };
   }
 
@@ -336,7 +340,7 @@ function filesFromText(text) {
       kind: isImageName(name) ? "image" : "document",
       mime: mimeFromName(name),
       size: 0,
-      url: `/api/files/${encodeURIComponent(storageName)}?name=${encodeURIComponent(name)}`,
+      url: downloadUrl(storageName, name),
     });
   }
   return files;
@@ -351,7 +355,7 @@ function fileFromStorage(storageName, displayName) {
     kind: isImageName(name) || isImageName(stored) ? "image" : "document",
     mime: mimeFromName(name || stored),
     size: 0,
-    url: `/api/files/${encodeURIComponent(stored)}?name=${encodeURIComponent(name)}`,
+    url: downloadUrl(stored, name),
   };
 }
 
@@ -359,7 +363,7 @@ async function proxyGeneratedFile(request, response) {
   const missing = missingSettings();
   if (missing.length) {
     return sendJson(response, 503, {
-      error: `.env 설정이 필요합니다: ${missing.join(", ")}`,
+      error: `${SETTINGS_LOCATION} 설정이 필요합니다: ${missing.join(", ")}`,
     });
   }
 
@@ -370,14 +374,22 @@ async function proxyGeneratedFile(request, response) {
     return sendJson(response, 400, { error: "잘못된 요청입니다." });
   }
 
-  const storageName = safeStorageName(
-    decodeURIComponent(parsed.pathname.slice("/api/files/".length)),
-  );
+  let storageName;
+  try {
+    storageName = safeStorageName(decodeURIComponent(parsed.pathname.slice("/api/files/".length)));
+  } catch {
+    return sendJson(response, 400, { error: "잘못된 파일 이름입니다." });
+  }
   if (!storageName) {
     return sendJson(response, 400, { error: "잘못된 파일 이름입니다." });
   }
 
   const displayName = safeFileName(parsed.searchParams.get("name") || storageName);
+  const signature = parsed.searchParams.get("sig") || "";
+  const expected = signDownload(storageName, displayName);
+  if (!/^[a-f0-9]{64}$/.test(signature) || !timingSafeEqual(Buffer.from(signature), Buffer.from(expected))) {
+    return sendJson(response, 404, { error: "파일을 찾을 수 없습니다." });
+  }
   const endpoint =
     `${BASE_URL}/api/v1/document/generated-files/${encodeURIComponent(storageName)}`;
 
@@ -392,13 +404,13 @@ async function proxyGeneratedFile(request, response) {
       });
     }
 
-    const mime =
-      upstream.headers.get("content-type") || mimeFromName(displayName);
+    const mime = mimeFromName(displayName);
+    const disposition = IMAGE_MIMES.has(mime) ? "inline" : "attachment";
     const buffer = Buffer.from(await upstream.arrayBuffer());
     const encoded = encodeURIComponent(displayName).replace(/['()]/g, escape);
     response.writeHead(200, {
       "Content-Type": mime.split(";")[0].trim(),
-      "Content-Disposition": `inline; filename="${encoded}"; filename*=UTF-8''${encoded}`,
+      "Content-Disposition": `${disposition}; filename="${encoded}"; filename*=UTF-8''${encoded}`,
       "Content-Length": buffer.length,
       "Cache-Control": "no-store",
     });
@@ -410,6 +422,17 @@ async function proxyGeneratedFile(request, response) {
     console.error("파일 전달 오류:", error.message);
     sendJson(response, 502, { error: "AnythingLLM에서 파일을 받지 못했습니다." });
   }
+}
+
+function signDownload(storageName, displayName) {
+  return createHmac("sha256", API_KEY)
+    .update(JSON.stringify([storageName, displayName]))
+    .digest("hex");
+}
+
+function downloadUrl(storageName, displayName) {
+  const query = new URLSearchParams({ name: displayName, sig: signDownload(storageName, displayName) });
+  return `/api/files/${encodeURIComponent(storageName)}?${query}`;
 }
 
 function safeStorageName(value) {
@@ -780,6 +803,6 @@ server.on("error", (error) => {
   process.exit(1);
 });
 
-server.listen(PORT, "127.0.0.1", () => {
-  console.log(`식물 관찰 학습: http://127.0.0.1:${PORT}`);
+server.listen(PORT, HOST, () => {
+  console.log(`식물 관찰 학습 서버가 ${HOST}:${PORT}에서 실행 중입니다.`);
 });
